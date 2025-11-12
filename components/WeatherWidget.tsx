@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react';
 import { WeatherData } from '@/lib/types';
 import { getStationById } from '@/lib/stations';
+import { getClientTracer, createHttpSpan, setResponseAttributes, recordSpanError } from '@/lib/otel-utils';
 
 interface WeatherWidgetProps {
   stationId: string;
@@ -22,24 +23,66 @@ export default function WeatherWidget({ stationId, label }: WeatherWidgetProps) 
     }
 
     const fetchWeather = async () => {
+      const tracer = getClientTracer();
+      const span = createHttpSpan(
+        tracer,
+        'client.fetch.weather',
+        {
+          url: `/api/weather?station=${stationId}`,
+          method: 'GET',
+        },
+        {
+          'weather.station.id': stationId,
+          'weather.component': 'WeatherWidget',
+        }
+      );
+
       setLoading(true);
       setError(null);
 
+      span.setAttributes({
+        'weather.ui.loading': true,
+      });
+
       try {
         const response = await fetch(`/api/weather?station=${stationId}`);
+
+        setResponseAttributes(span, response.status);
 
         if (!response.ok) {
           throw new Error('Failed to fetch weather data');
         }
 
         const data = await response.json();
+        const responseSize = JSON.stringify(data).length;
+
+        span.setAttributes({
+          'weather.response.size': responseSize,
+          'weather.response.is_mock': data.isMockData || false,
+          'weather.response.temperature': data.temperature,
+          'weather.response.condition': data.description,
+        });
+
         setWeather(data);
         setIsMockData(data.isMockData || false);
+
+        span.setAttributes({
+          'weather.ui.success': true,
+        });
       } catch (err) {
-        setError(err instanceof Error ? err.message : 'An error occurred');
+        const error = err instanceof Error ? err : new Error('An error occurred');
+        recordSpanError(span, error, {
+          'weather.ui.error': true,
+        });
+
+        setError(error.message);
         setWeather(null);
       } finally {
         setLoading(false);
+        span.setAttributes({
+          'weather.ui.loading': false,
+        });
+        span.end();
       }
     };
 
