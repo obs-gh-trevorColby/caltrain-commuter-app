@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import "./globals.css";
 import DarkModeToggle from "@/components/DarkModeToggle";
+import { OtelClientInit } from "@/components/OtelClientInit";
 
 export const metadata: Metadata = {
   title: "Caltrain Commuter - Train Schedules & Weather",
@@ -31,6 +32,7 @@ export default function RootLayout({
         />
       </head>
       <body className="bg-gray-50 dark:bg-gray-900 antialiased">
+        <OtelClientInit />
         <header className="shadow-lg" style={{ backgroundColor: "#E31837" }}>
           <div className="container mx-auto px-4 py-4">
             <div className="flex items-center justify-between">
