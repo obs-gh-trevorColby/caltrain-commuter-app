@@ -20,7 +20,7 @@ const otlpEndpoint =
   process.env.OTEL_EXPORTER_OTLP_ENDPOINT ?? "http://localhost:4318";
 const otlpEndpointBearerToken = process.env.OTEL_EXPORTER_OTLP_BEARER_TOKEN;
 
-const authHeader = otlpEndpointBearerToken
+const authHeader: Record<string, string> = otlpEndpointBearerToken
   ? { Authorization: `Bearer ${otlpEndpointBearerToken}` }
   : {};
 
