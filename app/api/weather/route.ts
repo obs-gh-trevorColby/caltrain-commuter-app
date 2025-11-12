@@ -2,50 +2,105 @@ import { NextRequest, NextResponse } from 'next/server';
 import { WeatherData } from '@/lib/types';
 import { getStationById } from '@/lib/stations';
 import { celsiusToFahrenheit, mpsToMph } from '@/lib/utils';
+import { serverTracer, instrumentedFetch, createProcessingSpan, recordSpanError } from '@/lib/otel-utils';
 
 export async function GET(request: NextRequest) {
-  const searchParams = request.nextUrl.searchParams;
-  const stationId = searchParams.get('station');
-
-  if (!stationId) {
-    return NextResponse.json(
-      { error: 'Station ID is required' },
-      { status: 400 }
-    );
-  }
-
-  const station = getStationById(stationId);
-  if (!station) {
-    return NextResponse.json(
-      { error: 'Invalid station ID' },
-      { status: 400 }
-    );
-  }
+  const span = serverTracer.startSpan('weather.api.get', {
+    attributes: {
+      'http.method': 'GET',
+      'http.route': '/api/weather',
+    },
+  });
 
   try {
+    const searchParams = request.nextUrl.searchParams;
+    const stationId = searchParams.get('station');
+
+    span.setAttributes({
+      'weather.station.id': stationId || 'unknown',
+    });
+
+    if (!stationId) {
+      span.setAttributes({ 'error.type': 'validation_error' });
+      return NextResponse.json(
+        { error: 'Station ID is required' },
+        { status: 400 }
+      );
+    }
+
+    const station = getStationById(stationId);
+    if (!station) {
+      span.setAttributes({ 'error.type': 'invalid_station' });
+      return NextResponse.json(
+        { error: 'Invalid station ID' },
+        { status: 400 }
+      );
+    }
+
+    span.setAttributes({
+      'weather.station.name': station.name,
+      'weather.station.coordinates.lat': station.coordinates.lat,
+      'weather.station.coordinates.lng': station.coordinates.lng,
+    });
+
     // Check if API key is configured
     if (!process.env.WEATHER_API_KEY) {
       console.log('Using mock weather data - configure WEATHER_API_KEY for real weather');
-      return NextResponse.json(
-        {
-          ...generateMockWeather(station.coordinates.lat),
-          isMockData: true
-        },
-        {
-          headers: {
-            'Cache-Control': 'public, s-maxage=600, stale-while-revalidate=1200'
+
+      span.setAttributes({
+        'weather.data.source': 'mock',
+        'weather.api.configured': false,
+      });
+
+      const mockWeatherSpan = createProcessingSpan(serverTracer, 'weather.generate_mock', {
+        'weather.station.lat': station.coordinates.lat,
+      });
+
+      try {
+        const mockData = generateMockWeather(station.coordinates.lat);
+        mockWeatherSpan.end();
+
+        return NextResponse.json(
+          {
+            ...mockData,
+            isMockData: true
+          },
+          {
+            headers: {
+              'Cache-Control': 'public, s-maxage=600, stale-while-revalidate=1200'
+            }
           }
-        }
-      );
+        );
+      } catch (error) {
+        recordSpanError(mockWeatherSpan, error as Error);
+        mockWeatherSpan.end();
+        throw error;
+      }
     }
 
     // Fetch weather from OpenWeatherMap API
     const apiKey = process.env.WEATHER_API_KEY;
     const { lat, lng } = station.coordinates;
+    const weatherUrl = `https://api.openweathermap.org/data/2.5/weather?lat=${lat}&lon=${lng}&appid=${apiKey}&units=metric`;
 
-    const response = await fetch(
-      `https://api.openweathermap.org/data/2.5/weather?lat=${lat}&lon=${lng}&appid=${apiKey}&units=metric`,
-      { next: { revalidate: 600 } } // Cache for 10 minutes
+    span.setAttributes({
+      'weather.data.source': 'openweathermap',
+      'weather.api.configured': true,
+      'weather.api.url': weatherUrl,
+    });
+
+    const response = await instrumentedFetch(
+      serverTracer,
+      'fetch.weather.openweathermap',
+      weatherUrl,
+      { next: { revalidate: 600 } }, // Cache for 10 minutes
+      {
+        apiProvider: 'openweathermap',
+        'weather.station.id': stationId,
+        'weather.station.coordinates.lat': lat,
+        'weather.station.coordinates.lng': lng,
+        'cache.ttl': 600,
+      }
     );
 
     if (!response.ok) {
@@ -53,6 +108,13 @@ export async function GET(request: NextRequest) {
     }
 
     const data = await response.json();
+    const responseSize = JSON.stringify(data).length;
+
+    span.setAttributes({
+      'weather.response.size': responseSize,
+      'weather.response.temperature': data.main?.temp,
+      'weather.response.condition': data.weather?.[0]?.description,
+    });
 
     const weatherData: WeatherData = {
       temperature: celsiusToFahrenheit(data.main.temp),
@@ -61,6 +123,12 @@ export async function GET(request: NextRequest) {
       windSpeed: mpsToMph(data.wind.speed),
       humidity: data.main.humidity
     };
+
+    span.setAttributes({
+      'weather.processed.temperature_f': weatherData.temperature,
+      'weather.processed.wind_speed_mph': weatherData.windSpeed,
+      'weather.processed.humidity': weatherData.humidity,
+    });
 
     return NextResponse.json({
       ...weatherData,
@@ -73,18 +141,38 @@ export async function GET(request: NextRequest) {
 
   } catch (error) {
     console.error('Weather API error:', error);
+    recordSpanError(span, error as Error, {
+      'weather.fallback': 'mock_data',
+    });
+
     // Return mock data as fallback
-    return NextResponse.json(
-      {
-        ...generateMockWeather(station.coordinates.lat),
-        isMockData: true
-      },
-      {
-        headers: {
-          'Cache-Control': 'public, s-maxage=300'
+    const fallbackSpan = createProcessingSpan(serverTracer, 'weather.fallback_mock', {
+      'weather.station.lat': station.coordinates.lat,
+      'weather.error.original': (error as Error).message,
+    });
+
+    try {
+      const mockData = generateMockWeather(station.coordinates.lat);
+      fallbackSpan.end();
+
+      return NextResponse.json(
+        {
+          ...mockData,
+          isMockData: true
+        },
+        {
+          headers: {
+            'Cache-Control': 'public, s-maxage=300'
+          }
         }
-      }
-    );
+      );
+    } catch (fallbackError) {
+      recordSpanError(fallbackSpan, fallbackError as Error);
+      fallbackSpan.end();
+      throw fallbackError;
+    }
+  } finally {
+    span.end();
   }
 }
 

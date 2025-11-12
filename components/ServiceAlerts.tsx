@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from 'react';
 import { ServiceAlert } from '@/lib/types';
+import { getClientTracer, createHttpSpan, setResponseAttributes, recordSpanError } from '@/lib/otel-utils';
 
 export default function ServiceAlerts() {
   const [alerts, setAlerts] = useState<ServiceAlert[]>([]);
@@ -10,17 +11,68 @@ export default function ServiceAlerts() {
 
   useEffect(() => {
     const fetchAlerts = async () => {
+      const tracer = getClientTracer();
+      const span = createHttpSpan(
+        tracer,
+        'client.fetch.alerts',
+        {
+          url: '/api/alerts',
+          method: 'GET',
+        },
+        {
+          'alerts.component': 'ServiceAlerts',
+        }
+      );
+
+      span.setAttributes({
+        'alerts.ui.loading': true,
+      });
+
       try {
         const response = await fetch('/api/alerts');
+
+        setResponseAttributes(span, response.status);
+
         if (response.ok) {
           const data = await response.json();
+          const responseSize = JSON.stringify(data).length;
+          const alertCount = data.alerts?.length || 0;
+
+          // Count alerts by severity
+          const alertsBySeverity = (data.alerts || []).reduce((acc: Record<string, number>, alert: ServiceAlert) => {
+            acc[alert.severity] = (acc[alert.severity] || 0) + 1;
+            return acc;
+          }, {});
+
+          span.setAttributes({
+            'alerts.response.size': responseSize,
+            'alerts.response.count': alertCount,
+            'alerts.response.is_mock': data.isMockData || false,
+            'alerts.severity.info': alertsBySeverity.info || 0,
+            'alerts.severity.warning': alertsBySeverity.warning || 0,
+            'alerts.severity.critical': alertsBySeverity.critical || 0,
+          });
+
           setAlerts(data.alerts || []);
           setIsMockData(data.isMockData || false);
+
+          span.setAttributes({
+            'alerts.ui.success': true,
+          });
+        } else {
+          throw new Error(`HTTP ${response.status}`);
         }
       } catch (error) {
         console.error('Error fetching alerts:', error);
+        recordSpanError(span, error as Error, {
+          'alerts.ui.error': true,
+        });
       } finally {
         setLoading(false);
+        span.setAttributes({
+          'alerts.ui.loading': false,
+        });
+        span.end();
       }
     };
 

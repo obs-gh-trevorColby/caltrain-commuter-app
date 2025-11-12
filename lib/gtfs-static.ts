@@ -5,6 +5,7 @@ import { Train } from './types';
 import { getStationById, stations } from './stations';
 import { TripUpdate, getTripDelay } from './gtfs-realtime';
 import { TrainDelay } from './caltrain-alerts-scraper';
+import { serverTracer, instrumentedFetch, createProcessingSpan, recordSpanError, instrumentFunction } from './otel-utils';
 
 interface GTFSStopTime {
   trip_id: string;
@@ -188,97 +189,244 @@ function parseCSV(csvText: string): any[] {
  * Load GTFS data from local files (for offline/mock data support)
  */
 async function loadLocalGTFSData(): Promise<boolean> {
-  try {
-    const fs = await import('fs/promises');
-    const path = await import('path');
+  return instrumentFunction(
+    serverTracer,
+    'gtfs.load_local_data',
+    async () => {
+      const fs = await import('fs/promises');
+      const path = await import('path');
 
-    const dataDir = path.join(process.cwd(), 'data', 'gtfs');
+      const dataDir = path.join(process.cwd(), 'data', 'gtfs');
 
-    // Read local GTFS files
-    const stopTimesData = await fs.readFile(path.join(dataDir, 'stop_times.txt'), 'utf8');
-    const tripsData = await fs.readFile(path.join(dataDir, 'trips.txt'), 'utf8');
-    const calendarData = await fs.readFile(path.join(dataDir, 'calendar.txt'), 'utf8');
-    const calendarDatesData = await fs.readFile(path.join(dataDir, 'calendar_dates.txt'), 'utf8');
+      const readSpan = createProcessingSpan(serverTracer, 'gtfs.read_local_files', {
+        'gtfs.source': 'local',
+        'gtfs.data_dir': dataDir,
+      });
 
-    // Parse CSV data
-    gtfsCache.stopTimes = parseCSV(stopTimesData);
-    gtfsCache.trips = parseCSV(tripsData);
-    gtfsCache.calendar = parseCSV(calendarData);
-    gtfsCache.calendarDates = parseCSV(calendarDatesData);
+      try {
+        // Read local GTFS files
+        const stopTimesData = await fs.readFile(path.join(dataDir, 'stop_times.txt'), 'utf8');
+        const tripsData = await fs.readFile(path.join(dataDir, 'trips.txt'), 'utf8');
+        const calendarData = await fs.readFile(path.join(dataDir, 'calendar.txt'), 'utf8');
+        const calendarDatesData = await fs.readFile(path.join(dataDir, 'calendar_dates.txt'), 'utf8');
 
-    gtfsCache.lastFetch = new Date();
+        readSpan.setAttributes({
+          'gtfs.files.stop_times.size': stopTimesData.length,
+          'gtfs.files.trips.size': tripsData.length,
+          'gtfs.files.calendar.size': calendarData.length,
+          'gtfs.files.calendar_dates.size': calendarDatesData.length,
+        });
+        readSpan.end();
 
-    console.log(`GTFS data loaded from local files: ${gtfsCache.stopTimes.length} stop times, ${gtfsCache.trips.length} trips`);
-    return true;
-  } catch (error) {
-    console.error('Error loading local GTFS data:', error);
-    return false;
-  }
+        const parseSpan = createProcessingSpan(serverTracer, 'gtfs.parse_local_csv', {
+          'gtfs.source': 'local',
+        });
+
+        try {
+          // Parse CSV data
+          gtfsCache.stopTimes = parseCSV(stopTimesData);
+          gtfsCache.trips = parseCSV(tripsData);
+          gtfsCache.calendar = parseCSV(calendarData);
+          gtfsCache.calendarDates = parseCSV(calendarDatesData);
+
+          parseSpan.setAttributes({
+            'gtfs.parsed.stop_times': gtfsCache.stopTimes.length,
+            'gtfs.parsed.trips': gtfsCache.trips.length,
+            'gtfs.parsed.calendar': gtfsCache.calendar.length,
+            'gtfs.parsed.calendar_dates': gtfsCache.calendarDates.length,
+          });
+          parseSpan.end();
+        } catch (error) {
+          recordSpanError(parseSpan, error as Error);
+          parseSpan.end();
+          throw error;
+        }
+
+        gtfsCache.lastFetch = new Date();
+
+        console.log(`GTFS data loaded from local files: ${gtfsCache.stopTimes.length} stop times, ${gtfsCache.trips.length} trips`);
+        return true;
+      } catch (error) {
+        recordSpanError(readSpan, error as Error);
+        readSpan.end();
+        console.error('Error loading local GTFS data:', error);
+        return false;
+      }
+    },
+    {
+      'gtfs.operation': 'load_local',
+    }
+  );
 }
 
 /**
  * Fetch and cache GTFS static data from remote source or local files
  */
 async function fetchGTFSData(): Promise<boolean> {
-  // Check cache validity
-  if (gtfsCache.lastFetch) {
-    const hoursSinceLastFetch =
-      (Date.now() - gtfsCache.lastFetch.getTime()) / (1000 * 60 * 60);
-    if (hoursSinceLastFetch < CACHE_DURATION_HOURS) {
-      return true; // Use cached data
-    }
-  }
+  const span = serverTracer.startSpan('gtfs.fetch_data', {
+    attributes: {
+      'gtfs.cache.duration_hours': CACHE_DURATION_HOURS,
+    },
+  });
 
-  const apiKey = process.env.TRANSIT_API_KEY;
+  try {
+    // Check cache validity
+    if (gtfsCache.lastFetch) {
+      const hoursSinceLastFetch =
+        (Date.now() - gtfsCache.lastFetch.getTime()) / (1000 * 60 * 60);
 
-  // Try remote fetch first if API key is configured
-  if (apiKey) {
-    try {
-      console.log('Fetching GTFS static data from remote source...');
+      span.setAttributes({
+        'gtfs.cache.hours_since_last_fetch': hoursSinceLastFetch,
+        'gtfs.cache.is_valid': hoursSinceLastFetch < CACHE_DURATION_HOURS,
+      });
 
-      // Use the direct Trillium Transit URL
-      // In production, you could use 511.org API:
-      // http://api.511.org/transit/datafeeds?api_key=${apiKey}&operator_id=CT
-      const gtfsUrl = 'https://data.trilliumtransit.com/gtfs/caltrain-ca-us/caltrain-ca-us.zip';
-
-      const response = await fetch(gtfsUrl);
-      if (!response.ok) {
-        throw new Error(`Failed to fetch GTFS data: ${response.status}`);
+      if (hoursSinceLastFetch < CACHE_DURATION_HOURS) {
+        span.setAttributes({
+          'gtfs.data.source': 'cache',
+          'gtfs.cached.stop_times': gtfsCache.stopTimes.length,
+          'gtfs.cached.trips': gtfsCache.trips.length,
+        });
+        return true; // Use cached data
       }
-
-      const arrayBuffer = await response.arrayBuffer();
-      const AdmZip = (await import('adm-zip')).default;
-      const zip = new AdmZip(Buffer.from(arrayBuffer));
-
-      // Parse required files
-      const stopTimesEntry = zip.getEntry('stop_times.txt');
-      const tripsEntry = zip.getEntry('trips.txt');
-      const calendarEntry = zip.getEntry('calendar.txt');
-      const calendarDatesEntry = zip.getEntry('calendar_dates.txt');
-
-      if (!stopTimesEntry || !tripsEntry || !calendarEntry) {
-        throw new Error('Required GTFS files not found in zip');
-      }
-
-      // Parse CSV data
-      gtfsCache.stopTimes = parseCSV(stopTimesEntry.getData().toString('utf8'));
-      gtfsCache.trips = parseCSV(tripsEntry.getData().toString('utf8'));
-      gtfsCache.calendar = parseCSV(calendarEntry.getData().toString('utf8'));
-      gtfsCache.calendarDates = calendarDatesEntry
-        ? parseCSV(calendarDatesEntry.getData().toString('utf8'))
-        : [];
-
-      gtfsCache.lastFetch = new Date();
-
-      console.log(`GTFS data loaded from remote: ${gtfsCache.stopTimes.length} stop times, ${gtfsCache.trips.length} trips`);
-      return true;
-    } catch (error) {
-      console.error('Error fetching remote GTFS data, trying local files:', error);
     }
-  }
 
-  // Fall back to local files (for mock data without API key)
-  return await loadLocalGTFSData();
+    const apiKey = process.env.TRANSIT_API_KEY;
+    span.setAttributes({
+      'gtfs.api.configured': !!apiKey,
+    });
+
+    // Try remote fetch first if API key is configured
+    if (apiKey) {
+      try {
+        console.log('Fetching GTFS static data from remote source...');
+
+        // Use the direct Trillium Transit URL
+        // In production, you could use 511.org API:
+        // http://api.511.org/transit/datafeeds?api_key=${apiKey}&operator_id=CT
+        const gtfsUrl = 'https://data.trilliumtransit.com/gtfs/caltrain-ca-us/caltrain-ca-us.zip';
+
+        span.setAttributes({
+          'gtfs.data.source': 'remote',
+          'gtfs.remote.url': gtfsUrl,
+        });
+
+        const response = await instrumentedFetch(
+          serverTracer,
+          'fetch.gtfs.static_data',
+          gtfsUrl,
+          {},
+          {
+            apiProvider: 'trillium-transit',
+            'gtfs.data.type': 'static',
+            'gtfs.format': 'zip',
+          }
+        );
+
+        if (!response.ok) {
+          throw new Error(`Failed to fetch GTFS data: ${response.status}`);
+        }
+
+        const arrayBuffer = await response.arrayBuffer();
+        const zipSize = arrayBuffer.byteLength;
+
+        span.setAttributes({
+          'gtfs.download.size': zipSize,
+        });
+
+        const extractSpan = createProcessingSpan(serverTracer, 'gtfs.extract_zip', {
+          'gtfs.zip.size': zipSize,
+        });
+
+        let zip;
+        try {
+          const AdmZip = (await import('adm-zip')).default;
+          zip = new AdmZip(Buffer.from(arrayBuffer));
+          extractSpan.end();
+        } catch (error) {
+          recordSpanError(extractSpan, error as Error);
+          extractSpan.end();
+          throw error;
+        }
+
+        const parseSpan = createProcessingSpan(serverTracer, 'gtfs.parse_zip_files', {
+          'gtfs.source': 'remote',
+        });
+
+        try {
+          // Parse required files
+          const stopTimesEntry = zip.getEntry('stop_times.txt');
+          const tripsEntry = zip.getEntry('trips.txt');
+          const calendarEntry = zip.getEntry('calendar.txt');
+          const calendarDatesEntry = zip.getEntry('calendar_dates.txt');
+
+          if (!stopTimesEntry || !tripsEntry || !calendarEntry) {
+            throw new Error('Required GTFS files not found in zip');
+          }
+
+          const stopTimesData = stopTimesEntry.getData().toString('utf8');
+          const tripsData = tripsEntry.getData().toString('utf8');
+          const calendarData = calendarEntry.getData().toString('utf8');
+          const calendarDatesData = calendarDatesEntry?.getData().toString('utf8') || '';
+
+          parseSpan.setAttributes({
+            'gtfs.files.stop_times.size': stopTimesData.length,
+            'gtfs.files.trips.size': tripsData.length,
+            'gtfs.files.calendar.size': calendarData.length,
+            'gtfs.files.calendar_dates.size': calendarDatesData.length,
+          });
+
+          // Parse CSV data
+          gtfsCache.stopTimes = parseCSV(stopTimesData);
+          gtfsCache.trips = parseCSV(tripsData);
+          gtfsCache.calendar = parseCSV(calendarData);
+          gtfsCache.calendarDates = calendarDatesEntry
+            ? parseCSV(calendarDatesData)
+            : [];
+
+          parseSpan.setAttributes({
+            'gtfs.parsed.stop_times': gtfsCache.stopTimes.length,
+            'gtfs.parsed.trips': gtfsCache.trips.length,
+            'gtfs.parsed.calendar': gtfsCache.calendar.length,
+            'gtfs.parsed.calendar_dates': gtfsCache.calendarDates.length,
+          });
+          parseSpan.end();
+
+          gtfsCache.lastFetch = new Date();
+
+          span.setAttributes({
+            'gtfs.result.stop_times': gtfsCache.stopTimes.length,
+            'gtfs.result.trips': gtfsCache.trips.length,
+          });
+
+          console.log(`GTFS data loaded from remote: ${gtfsCache.stopTimes.length} stop times, ${gtfsCache.trips.length} trips`);
+          return true;
+        } catch (error) {
+          recordSpanError(parseSpan, error as Error);
+          parseSpan.end();
+          throw error;
+        }
+      } catch (error) {
+        console.error('Error fetching remote GTFS data, trying local files:', error);
+        recordSpanError(span, error as Error, {
+          'gtfs.fallback': 'local_files',
+        });
+      }
+    }
+
+    // Fall back to local files (for mock data without API key)
+    span.setAttributes({
+      'gtfs.fallback.reason': apiKey ? 'remote_failed' : 'no_api_key',
+    });
+
+    const result = await loadLocalGTFSData();
+    span.setAttributes({
+      'gtfs.fallback.success': result,
+    });
+
+    return result;
+  } finally {
+    span.end();
+  }
 }
 
 /**
@@ -357,48 +505,99 @@ export async function getScheduledTrains(
   tripUpdates: TripUpdate[] = [],
   caltrainAlerts: Map<string, TrainDelay> = new Map()
 ): Promise<Train[]> {
-  console.log(`getScheduledTrains called: ${originStationId} -> ${destinationStationId}`);
+  const span = serverTracer.startSpan('gtfs.get_scheduled_trains', {
+    attributes: {
+      'gtfs.origin.station_id': originStationId,
+      'gtfs.destination.station_id': destinationStationId,
+      'gtfs.query.date': date.toISOString(),
+      'gtfs.realtime.trip_updates_count': tripUpdates.length,
+      'gtfs.alerts.count': caltrainAlerts.size,
+    },
+  });
 
-  // Ensure GTFS data is loaded
-  const loaded = await fetchGTFSData();
-  if (!loaded || gtfsCache.trips.length === 0) {
-    console.error('GTFS data not loaded or empty');
-    return []; // Return empty if GTFS not available
-  }
+  try {
+    console.log(`getScheduledTrains called: ${originStationId} -> ${destinationStationId}`);
 
-  console.log(`GTFS data loaded: ${gtfsCache.trips.length} trips, ${gtfsCache.stopTimes.length} stop times`);
+    // Ensure GTFS data is loaded
+    const loaded = await fetchGTFSData();
+    if (!loaded || gtfsCache.trips.length === 0) {
+      console.error('GTFS data not loaded or empty');
+      span.setAttributes({
+        'gtfs.data.loaded': false,
+        'gtfs.result.count': 0,
+      });
+      return []; // Return empty if GTFS not available
+    }
 
-  const originStation = getStationById(originStationId);
-  const destinationStation = getStationById(destinationStationId);
+    span.setAttributes({
+      'gtfs.data.loaded': true,
+      'gtfs.data.trips_count': gtfsCache.trips.length,
+      'gtfs.data.stop_times_count': gtfsCache.stopTimes.length,
+    });
 
-  if (!originStation || !destinationStation) {
-    console.error('Station not found:', { originStation, destinationStation });
-    return [];
-  }
+    console.log(`GTFS data loaded: ${gtfsCache.trips.length} trips, ${gtfsCache.stopTimes.length} stop times`);
 
-  // Determine which service is active today
-  const serviceId = getActiveServiceId(date, gtfsCache.calendar, gtfsCache.calendarDates);
-  if (!serviceId) {
-    console.warn('No active service found for date:', date);
-    return [];
-  }
+    const originStation = getStationById(originStationId);
+    const destinationStation = getStationById(destinationStationId);
 
-  console.log(`Active service ID: ${serviceId} for date ${date.toLocaleDateString()}`);
+    if (!originStation || !destinationStation) {
+      console.error('Station not found:', { originStation, destinationStation });
+      span.setAttributes({
+        'gtfs.error.type': 'station_not_found',
+        'gtfs.origin.found': !!originStation,
+        'gtfs.destination.found': !!destinationStation,
+        'gtfs.result.count': 0,
+      });
+      return [];
+    }
 
-  // Get all trips for this service
-  const activeTrips = gtfsCache.trips.filter((trip) => trip.service_id === serviceId);
-  console.log(`Found ${activeTrips.length} active trips for service ${serviceId}`);
+    span.setAttributes({
+      'gtfs.origin.name': originStation.name,
+      'gtfs.destination.name': destinationStation.name,
+    });
 
-  // Determine direction based on actual station geographic order
-  // Stations array is ordered north to south, so we can use array indices
-  const originIndex = stations.findIndex(s => s.id === originStationId);
-  const destIndex = stations.findIndex(s => s.id === destinationStationId);
+    // Determine which service is active today
+    const serviceId = getActiveServiceId(date, gtfsCache.calendar, gtfsCache.calendarDates);
+    if (!serviceId) {
+      console.warn('No active service found for date:', date);
+      span.setAttributes({
+        'gtfs.error.type': 'no_active_service',
+        'gtfs.result.count': 0,
+      });
+      return [];
+    }
 
-  // If origin is before destination in the array, we're going south (higher index)
-  const isNorthbound = originIndex > destIndex;
-  const directionId = isNorthbound ? '0' : '1'; // 0 = Northbound, 1 = Southbound
+    span.setAttributes({
+      'gtfs.service.id': serviceId,
+    });
 
-  console.log(`Direction: ${originStation.name} (index ${originIndex}) -> ${destinationStation.name} (index ${destIndex}) = ${isNorthbound ? 'Northbound' : 'Southbound'} (direction_id=${directionId})`);
+    console.log(`Active service ID: ${serviceId} for date ${date.toLocaleDateString()}`);
+
+    // Get all trips for this service
+    const activeTrips = gtfsCache.trips.filter((trip) => trip.service_id === serviceId);
+    console.log(`Found ${activeTrips.length} active trips for service ${serviceId}`);
+
+    span.setAttributes({
+      'gtfs.active_trips.count': activeTrips.length,
+    });
+
+    // Determine direction based on actual station geographic order
+    // Stations array is ordered north to south, so we can use array indices
+    const originIndex = stations.findIndex(s => s.id === originStationId);
+    const destIndex = stations.findIndex(s => s.id === destinationStationId);
+
+    // If origin is before destination in the array, we're going south (higher index)
+    const isNorthbound = originIndex > destIndex;
+    const directionId = isNorthbound ? '0' : '1'; // 0 = Northbound, 1 = Southbound
+
+    span.setAttributes({
+      'gtfs.direction.is_northbound': isNorthbound,
+      'gtfs.direction.id': directionId,
+      'gtfs.origin.index': originIndex,
+      'gtfs.destination.index': destIndex,
+    });
+
+    console.log(`Direction: ${originStation.name} (index ${originIndex}) -> ${destinationStation.name} (index ${destIndex}) = ${isNorthbound ? 'Northbound' : 'Southbound'} (direction_id=${directionId})`);
 
   // Map station codes to GTFS stop IDs
   // GTFS uses numeric stop IDs: 7001X format where X is 1 (NB) or 2 (SB)
@@ -599,10 +798,30 @@ export async function getScheduledTrains(
     return [];
   }
 
-  console.log(`Found ${trains.length} trains (including en-route), sorting and limiting to 5`);
+    console.log(`Found ${trains.length} trains (including en-route), sorting and limiting to 5`);
 
-  // Sort all trains by departure time and return the next 5
-  return trains
-    .sort((a, b) => new Date(a.departureTime).getTime() - new Date(b.departureTime).getTime())
-    .slice(0, 5);
+    // Sort all trains by departure time and return the next 5
+    const sortedTrains = trains
+      .sort((a, b) => new Date(a.departureTime).getTime() - new Date(b.departureTime).getTime())
+      .slice(0, 5);
+
+    span.setAttributes({
+      'gtfs.result.count': sortedTrains.length,
+      'gtfs.trains.total_found': trains.length,
+      'gtfs.trains.returned': sortedTrains.length,
+    });
+
+    return sortedTrains;
+  } catch (error) {
+    console.error('Error processing GTFS trips:', error);
+    recordSpanError(span, error as Error, {
+      'gtfs.operation': 'get_scheduled_trains',
+    });
+    span.setAttributes({
+      'gtfs.result.count': 0,
+    });
+    return [];
+  } finally {
+    span.end();
+  }
 }

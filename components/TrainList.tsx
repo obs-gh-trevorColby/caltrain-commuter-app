@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react';
 import { Train } from '@/lib/types';
 import { formatTime, formatDuration } from '@/lib/utils';
+import { getClientTracer, createHttpSpan, setResponseAttributes, recordSpanError } from '@/lib/otel-utils';
 
 interface TrainListProps {
   originId: string;
@@ -24,28 +25,93 @@ export default function TrainList({ originId, destinationId }: TrainListProps) {
     }
 
     const fetchTrains = async () => {
+      const tracer = getClientTracer();
+      const span = createHttpSpan(
+        tracer,
+        'client.fetch.trains',
+        {
+          url: `/api/trains?origin=${originId}&destination=${destinationId}`,
+          method: 'GET',
+        },
+        {
+          'trains.origin.id': originId,
+          'trains.destination.id': destinationId,
+          'trains.component': 'TrainList',
+        }
+      );
+
       setLoading(true);
       setError(null);
+
+      span.setAttributes({
+        'trains.ui.loading': true,
+      });
 
       try {
         const response = await fetch(
           `/api/trains?origin=${originId}&destination=${destinationId}`
         );
 
+        setResponseAttributes(span, response.status);
+
         if (!response.ok) {
           throw new Error('Failed to fetch train data');
         }
 
         const data = await response.json();
+        const responseSize = JSON.stringify(data).length;
+        const trainCount = data.trains?.length || 0;
+
+        span.setAttributes({
+          'trains.response.size': responseSize,
+          'trains.response.count': trainCount,
+          'trains.response.is_mock_data': data.isMockData || false,
+          'trains.response.is_mock_schedule': data.isMockSchedule || false,
+        });
+
+        // Count trains by type and status
+        const trainsByType = (data.trains || []).reduce((acc: Record<string, number>, train: Train) => {
+          acc[train.type] = (acc[train.type] || 0) + 1;
+          return acc;
+        }, {});
+
+        const trainsByStatus = (data.trains || []).reduce((acc: Record<string, number>, train: Train) => {
+          const status = train.status || 'unknown';
+          acc[status] = (acc[status] || 0) + 1;
+          return acc;
+        }, {});
+
+        span.setAttributes({
+          'trains.types.local': trainsByType.Local || 0,
+          'trains.types.limited': trainsByType.Limited || 0,
+          'trains.types.express': trainsByType.Express || 0,
+          'trains.status.on_time': trainsByStatus['on-time'] || 0,
+          'trains.status.delayed': trainsByStatus.delayed || 0,
+          'trains.status.cancelled': trainsByStatus.cancelled || 0,
+        });
+
         setTrains(data.trains || []);
         setIsMockData(data.isMockData || false);
         setIsMockSchedule(data.isMockSchedule || false);
         setLastUpdated(new Date());
+
+        span.setAttributes({
+          'trains.ui.success': true,
+        });
       } catch (err) {
-        setError(err instanceof Error ? err.message : 'An error occurred');
+        const error = err instanceof Error ? err : new Error('An error occurred');
+        recordSpanError(span, error, {
+          'trains.ui.error': true,
+        });
+
+        setError(error.message);
         setTrains([]);
       } finally {
         setLoading(false);
+        span.setAttributes({
+          'trains.ui.loading': false,
+        });
+        span.end();
       }
     };
 
