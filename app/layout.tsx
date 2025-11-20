@@ -31,7 +31,7 @@ export default function RootLayout({
           }}
         />
       </head>
-      <body className="bg-gray-50 dark:bg-gray-900 antialiased">
+      <body className="bg-red-500 dark:bg-red-800 antialiased">
         <OtelClientInit />
         <header className="shadow-lg" style={{ backgroundColor: "#E31837" }}>
           <div className="container mx-auto px-4 py-4">
